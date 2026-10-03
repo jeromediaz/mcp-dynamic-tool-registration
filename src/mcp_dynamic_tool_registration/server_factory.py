@@ -31,6 +31,7 @@ sub-apps, so the session manager cannot bring its own.
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import logging
@@ -40,6 +41,8 @@ from typing import Any, Protocol
 
 import pydantic
 from mcp import types
+from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+from mcp.server.auth.provider import AccessToken
 from mcp.server.lowlevel import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
@@ -64,6 +67,10 @@ type ErrorHandler = Callable[[str, Exception], types.CallToolResult | None]
 type RequestHook = Callable[[str, str | None, str], None]
 """Called as ``(server_name, mcp_session_id, http_method)`` for each
 authenticated request, before it is handled."""
+
+type PrincipalResolver = Callable[[Any], str]
+"""Returns a stable identifier of the caller (e.g. a user id) from a
+validated token payload. MCP sessions are bound to it."""
 
 
 class AuditHook(Protocol):
@@ -425,6 +432,7 @@ def build_streamable_http_asgi_app(
     error_handler: ErrorHandler | None = default_error_handler,
     coerce_args: bool = True,
     request_hook: RequestHook | None = None,
+    principal_of: PrincipalResolver | None = None,
 ) -> tuple[AsgiApp, StreamableHTTPSessionManager]:
     """Build a bearer-token-gated Streamable HTTP ASGI app for one MCP server.
 
@@ -446,6 +454,13 @@ def build_streamable_http_asgi_app(
         request_hook: Called as ``(server_name, mcp_session_id,
             http_method)`` for each authenticated request, just before it is
             handled; failures are logged and never affect the request.
+        principal_of: Maps the validated payload to a stable caller id
+            (e.g. a user id). Each MCP session is bound to the caller that
+            created it: a request carrying another caller's credentials and
+            an existing ``mcp-session-id`` is answered as if the session did
+            not exist (404). Defaults to a SHA-256 of the bearer token, which
+            binds a session to the exact token that created it. An exception
+            raised here is treated like an invalid token (401).
     """
     mcp_server = build_mcp_server(
         name,
@@ -471,9 +486,10 @@ def build_streamable_http_asgi_app(
     # that snapshot for its whole lifetime. Follow-up requests to the same
     # session don't re-run the handler in the per-request task at all (they
     # just forward bytes to the already-running session task), so they don't
-    # need to re-set the contextvar — which is fine, since a session is
-    # already scoped to one authenticated identity for its lifetime (the SDK
-    # itself enforces this via `_session_owners`).
+    # need to re-set the contextvar. That is only safe because a session is
+    # bound to one caller for its lifetime: the SDK rejects a request whose
+    # ``scope["user"]`` principal differs from the session creator's, which
+    # is why asgi_app publishes the caller as an SDK ``AuthenticatedUser``.
     session_manager = StreamableHTTPSessionManager(app=mcp_server, stateless=False)
 
     async def asgi_app(scope: Mapping[str, Any], receive: Any, send: Any) -> None:
@@ -487,12 +503,28 @@ def build_streamable_http_asgi_app(
 
         try:
             token_payload = token_validator(token)
+            principal = (
+                principal_of(token_payload)
+                if principal_of is not None
+                else hashlib.sha256(token.encode("utf-8")).hexdigest()
+            )
         except Exception:
             logger.info(
                 "MCP request rejected: token validation failed for server=%s", name
             )
             await _send_json_error(send, 401, "Invalid or unauthorized token")
             return
+
+        # The SDK binds each session to the principal found in scope["user"]
+        # (see StreamableHTTPSessionManager) and rejects other callers.
+        scope = {
+            **scope,
+            "user": AuthenticatedUser(
+                AccessToken(
+                    token=token, client_id=principal, scopes=[], subject=principal
+                )
+            ),
+        }
 
         var_token = (
             current_request_context.set(context_factory(token_payload))
@@ -509,7 +541,7 @@ def build_streamable_http_asgi_app(
                     )
                 except Exception:
                     logger.exception("request_hook failed for server=%s", name)
-            await session_manager.handle_request(scope, receive, send)  # type: ignore[arg-type]
+            await session_manager.handle_request(scope, receive, send)
         finally:
             if var_token is not None:
                 current_request_context.reset(var_token)

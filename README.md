@@ -23,6 +23,119 @@ context — plugs in through a hook instead of an import.
 pip install mcp-dynamic-tool-registration
 ```
 
+## Quickstart
+
+A complete server in one file, `server.py` (everything it imports comes with
+`pip install mcp-dynamic-tool-registration`):
+
+```python
+import contextlib
+
+import uvicorn
+from pydantic import BaseModel
+from starlette.applications import Starlette
+from starlette.routing import Route
+
+from mcp_dynamic_tool_registration import (
+    ToolRegistry,
+    build_streamable_http_asgi_app,
+    register_tool,
+    register_tool_module,
+)
+
+
+class AddInput(BaseModel):
+    a: int
+    b: int
+
+
+@register_tool("add", input_schema=AddInput, read_only_hint=True)
+def add(a: int, b: int, context=None):
+    """Add two integers."""
+    return {"sum": a + b, "caller": context["user"]}
+
+
+# Authentication: map the bearer token to a payload, or raise to reject (401).
+API_KEYS = {"dev-key-alice": "alice", "dev-key-bob": "bob"}
+
+
+def validate_token(token: str) -> dict:
+    try:
+        return {"user": API_KEYS[token]}
+    except KeyError:
+        raise PermissionError("unknown API key") from None
+
+
+# Collect the @register_tool functions of this module into a registry.
+registry = ToolRegistry("demo")
+register_tool_module(registry, __name__, {})
+
+asgi_app, session_manager = build_streamable_http_asgi_app(
+    "demo",
+    registry,
+    token_validator=validate_token,
+    context_factory=lambda payload: payload,  # becomes the handler's `context`
+    principal_of=lambda payload: payload["user"],  # binds sessions to the user
+)
+
+
+@contextlib.asynccontextmanager
+async def lifespan(app):
+    async with session_manager.run():  # required, for the app's lifetime
+        yield
+
+
+methods = ["GET", "POST", "DELETE"]
+app = Starlette(
+    routes=[
+        Route("/mcp", endpoint=asgi_app, methods=methods),
+        Route("/mcp/", endpoint=asgi_app, methods=methods),
+    ],
+    lifespan=lifespan,
+)
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=8000)
+```
+
+Run it with `python server.py`, then connect with the official MCP Python
+client (`client.py`):
+
+```python
+import asyncio
+
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+
+
+async def main():
+    headers = {"Authorization": "Bearer dev-key-alice"}
+    async with streamablehttp_client("http://127.0.0.1:8000/mcp", headers=headers) as (
+        read,
+        write,
+        _,
+    ):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            tools = await session.list_tools()
+            print([tool.name for tool in tools.tools])
+            result = await session.call_tool("add", {"a": 2, "b": 3})
+            print(result.structuredContent)
+
+
+asyncio.run(main())
+```
+
+```
+$ python client.py
+['add']
+{'sum': 5, 'caller': 'alice'}
+```
+
+Without a valid `Authorization: Bearer ...` header the server answers `401`
+before any MCP processing. The rest of this README explains each piece:
+organising tools in modules, authentication, hooks and deployment notes.
+
 ## How to Use
 
 ### A module of tools
@@ -214,6 +327,106 @@ Requests without a valid bearer token get a JSON `401` before the session
 manager is ever reached. `build_mcp_server(name, tool_registry)` reads the
 registry on every request, so tools registered later are served too.
 
+### Authentication
+
+The ASGI app authenticates **every HTTP request** (the initial `initialize`
+and every follow-up on the session) with a bearer token. The library does not
+issue or verify tokens itself: you supply the policy.
+
+**What the client sends.** An `Authorization: Bearer <token>` header (the
+`Bearer` scheme is case-insensitive). The token is never read from query
+parameters or cookies.
+
+**`token_validator(token) -> payload`.** Called with the raw token. Return any
+object describing the caller (a dict of claims, a user object…); **raise any
+exception to reject** the request. Returning a value — even `None` — means
+"valid". The payload is then passed to `context_factory` and `principal_of`.
+
+**Responses on failure** (JSON, status `401`, before any MCP processing; no
+`WWW-Authenticate` header is sent):
+
+| Situation | Body |
+|---|---|
+| no `Authorization: Bearer` header, or an empty token | `{"error": "Missing bearer token"}` |
+| `token_validator` (or `principal_of`) raised | `{"error": "Invalid or unauthorized token"}` |
+
+Rejections are logged at INFO level without the token.
+
+**`context_factory(payload) -> context`.** Builds the object handed to tool
+handlers as their `context` keyword (for example the payload itself, or a user
+object loaded from your database). Leave it unset if handlers need no caller
+information; they are then called without `context`.
+
+**Session binding — `principal_of(payload) -> str`.** Streamable HTTP sessions
+are long-lived: the client receives an `mcp-session-id` at `initialize` and
+reuses it. Each session is bound to the caller that created it: a request
+whose credentials map to a different principal and that presents an existing
+session id is answered `404 Session not found`, exactly as if the session did
+not exist. `principal_of` returns that principal — typically a user id, so a
+refreshed token of the same user keeps working on its session. Without it, the
+principal is a SHA-256 of the bearer token, which binds a session to the exact
+token that created it.
+
+**Context lifetime caveat.** Tool calls of a session run inside the session's
+own task, which keeps the context built for the **session-creating** request.
+Follow-up requests are still authenticated (so a revoked or expired token is
+rejected with `401`), and session binding guarantees they come from the same
+principal, but a context field that changes during a session (for example the
+caller's roles) is only refreshed when the client opens a new session. If you
+need per-call freshness, load it inside the handler from the context's user id.
+
+**Example: API keys** — see the Quickstart (`validate_token` looks the key up
+and raises `PermissionError` for unknown keys).
+
+**Example: JWT** (requires `pip install pyjwt`):
+
+```python
+import time
+
+import jwt  # pip install pyjwt
+
+SECRET = "replace-with-a-32-byte-or-longer-secret"  # load from your secret store
+AUDIENCE = "https://example.com/mcp"
+
+
+def validate_jwt(token: str) -> dict:
+    # Raises on a bad signature, an expired token or a wrong audience,
+    # which the ASGI app turns into a 401.
+    return jwt.decode(token, SECRET, algorithms=["HS256"], audience=AUDIENCE)
+
+
+def principal_of(claims: dict) -> str:
+    return claims["sub"]
+
+
+# Demo: a valid token, then an expired one.
+now = int(time.time())
+good = jwt.encode({"sub": "alice", "aud": AUDIENCE, "exp": now + 300}, SECRET, "HS256")
+expired = jwt.encode({"sub": "alice", "aud": AUDIENCE, "exp": now - 1}, SECRET, "HS256")
+print(principal_of(validate_jwt(good)))
+try:
+    validate_jwt(expired)
+except jwt.ExpiredSignatureError:
+    print("expired -> 401")
+# alice
+# expired -> 401
+```
+
+Wire it with
+`build_streamable_http_asgi_app(..., token_validator=validate_jwt, principal_of=principal_of, context_factory=lambda claims: claims)`.
+
+**What stays with the host.** The library only checks bearer tokens. Issuing
+them (login, API-key management, an OAuth authorization server) and
+advertising them to clients (OAuth discovery such as protected-resource
+metadata, `WWW-Authenticate` challenges) are up to your application. Clients
+that can send a custom header — the MCP Python SDK client
+(`streamablehttp_client(url, headers=...)`), most agent frameworks — work out
+of the box; for clients that only speak OAuth, put an OAuth layer in front or
+use a stdio-to-HTTP bridge that can add the header.
+
+Always serve the endpoint over HTTPS in production: the bearer token is the
+whole credential.
+
 ### Confirming destructive calls
 
 `confirm_destructive` asks the connected MCP client to confirm a destructive
@@ -273,9 +486,10 @@ library imports nothing from your framework.
 | `error_handler` | `(tool_name, exc) -> CallToolResult \| None` | Maps handler exceptions to `isError` results; return `None` to re-raise to the SDK. Defaults to `default_error_handler`: elicitation errors and any exception with a duck-typed `status_code` in `[400, 500)` become `usage_error_result(...)` (text prefixed `Tool '<name>' error: `), everything else propagates. `None` disables the mapping entirely. |
 | `coerce_args` | `bool` (default `True`) | Runs `coerce_json_strings` on the call arguments before validation: some LLM clients double-encode containers (`"[\"a\", \"b\"]"` instead of `["a", "b"]`); strings that *start* with `[` or `{` **and** parse as JSON are decoded, anything else is left alone so the normal validation error still happens. |
 | `request_hook` | `(server_name, mcp_session_id, http_method) -> None` | ASGI app only: called for each **authenticated** request, after the token validates and after the context is set, just before `handle_request`. Detection only (metrics/spans); exceptions are logged and swallowed so a broken hook never affects the request. |
+| `principal_of` | `(token_payload) -> str` | ASGI app only: the caller id each MCP session is bound to (see *Authentication*). Defaults to a SHA-256 of the bearer token. |
 | `context_factory` | `(token_payload) -> context` | ASGI app only: builds the per-request context from the validated payload and publishes it on `current_request_context`. `None` means no context is published and handlers are built without `context` injection (`inject_context=False` on `build_mcp_server`). |
 
-The types `AuditHook`, `ContextFactory`, `ErrorHandler` and `RequestHook` are
+The types `AuditHook`, `ContextFactory`, `ErrorHandler`, `PrincipalResolver` and `RequestHook` are
 exported for annotating your own wrappers. `current_request_context` is the
 underlying `ContextVar`, exposed for hosts (and tests) that want to inspect or
 set it directly.
@@ -288,7 +502,7 @@ import mcp_dynamic_tool_registration as m
 print(sorted(m.__all__))
 # ['AsgiApp', 'AuditHook', 'ContextFactory', 'DeclinedError',
 #  'ElicitationNotSupportedError', 'ErrorHandler', 'McpServerRegistry',
-#  'RequestHook', 'ServerRegistry', 'ToolEnabledCallback', 'ToolRegistry',
+#  'PrincipalResolver', 'RequestHook', 'ServerRegistry', 'ToolEnabledCallback', 'ToolRegistry',
 #  'ToolSpec', 'build_mcp_server', 'build_streamable_http_asgi_app',
 #  'coerce_json_strings', 'confirm_destructive', 'current_request_context',
 #  'default_error_handler', 'invoke_tool', 'is_register_tool', 'register_tool',
