@@ -56,6 +56,9 @@ def add(a: int, b: int, context=None):
 
 
 # Authentication: map the bearer token to a payload, or raise to reject (401).
+# EXAMPLE ONLY — hardcoded keys for this demo. Replace validate_token with your
+# own strategy (API keys from a database or secret store, JWT verification,
+# OAuth token introspection...). See the "Authentication" section.
 API_KEYS = {"dev-key-alice": "alice", "dev-key-bob": "bob"}
 
 
@@ -133,7 +136,12 @@ $ python client.py
 ```
 
 Without a valid `Authorization: Bearer ...` header the server answers `401`
-before any MCP processing. The rest of this README explains each piece:
+before any MCP processing.
+
+> **The token check above is only an example.** The library does not ship any
+> authentication strategy: you provide `token_validator`, and it decides who
+> gets in. Never deploy hardcoded keys; see [Authentication](#authentication)
+> for the contract and a JWT example. The rest of this README explains each piece:
 organising tools in modules, authentication, hooks and deployment notes.
 
 ## How to Use
@@ -376,7 +384,13 @@ caller's roles) is only refreshed when the client opens a new session. If you
 need per-call freshness, load it inside the handler from the context's user id.
 
 **Example: API keys** — see the Quickstart (`validate_token` looks the key up
-and raises `PermissionError` for unknown keys).
+and raises `PermissionError` for unknown keys). It is a demo with hardcoded
+keys: in a real deployment, look keys up in your own store (ideally comparing
+hashes) and handle revocation.
+
+The examples below are illustrations too: the right strategy depends on how
+your application issues credentials, and implementing it is your
+responsibility.
 
 **Example: JWT** (requires `pip install pyjwt`):
 
