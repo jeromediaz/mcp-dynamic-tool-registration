@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=77.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.package-data]
+"mcp_dynamic_tool_registration" = ["py.typed"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project]
+name = "mcp-dynamic-tool-registration"
+version = "0.1.0"
+authors = [
+  { name="Jérôme DIAZ", email="jerome_diaz@me.com" },
+]
+description = "Decorator-based, registry-first dynamic tool registration for MCP (Model Context Protocol) servers, with a bearer-token Streamable HTTP ASGI app."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+classifiers = [
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+    "Typing :: Typed",
+]
+keywords = ["mcp", "model-context-protocol", "tools", "registry", "dynamic"]
+dependencies = [
+    "mcp>=1.28.1,<2",
+    "pydantic>=2.11,<3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff", "mypy"]
+
+[project.urls]
+"Homepage" = "https://github.com/jeromediaz/mcp-dynamic-tool-registration"
+"Bug Tracker" = "https://github.com/jeromediaz/mcp-dynamic-tool-registration/issues"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "B", "C4", "C9", "I", "PERF", "RUF", "SIM", "UP", "W"]
+ignore = ["E501"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 15
+
+[tool.mypy]
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+strict_equality = true
