@@ -6,11 +6,15 @@ import asyncio
 import json
 
 from mcp import types
+from pydantic import BaseModel
 
 from mcp_dynamic_tool_registration.server_factory import (
+    DEFAULT_ARGUMENT_LIMITS,
+    ArgumentLimits,
     AsgiApp,
     _extract_bearer_token,
     _extract_header,
+    _validate_arguments,
     coerce_json_strings,
     usage_error_result,
 )
@@ -188,3 +192,42 @@ class TestUsageErrorResult:
         text = result.content[0].text
         assert isinstance(text, str)
         assert text.startswith("Tool 'x' error: ")
+
+
+class _EchoInput(BaseModel):
+    text: str
+
+
+class TestValidateArguments:
+    """_validate_arguments: shape checks (pydantic + unknown keys) keep
+    their messages, and argument bounds run last."""
+
+    def test_in_bounds_arguments_return_none(self):
+        assert (
+            _validate_arguments(_EchoInput, {"text": "hi"}, DEFAULT_ARGUMENT_LIMITS)
+            is None
+        )
+
+    def test_out_of_bounds_arguments_return_a_message(self):
+        error = _validate_arguments(
+            _EchoInput, {"text": "x" * 11}, ArgumentLimits(max_string_length=10)
+        )
+        assert error is not None
+        assert "limit is 10" in error
+
+    def test_unknown_key_message_unchanged(self):
+        error = _validate_arguments(_EchoInput, {"text": "hi", "nope": 1})
+        assert error == "Unexpected argument(s): nope"
+
+    def test_pydantic_message_unchanged(self):
+        error = _validate_arguments(_EchoInput, {})
+        assert error is not None
+        assert "Field required" in error
+
+    def test_shape_checks_win_over_bounds(self):
+        # A bad shape AND an oversized value: the shape error is reported.
+        error = _validate_arguments(
+            _EchoInput, {"text": 123}, ArgumentLimits(max_string_length=1)
+        )
+        assert error is not None
+        assert "string_type" in error

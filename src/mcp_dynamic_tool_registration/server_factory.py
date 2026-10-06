@@ -46,10 +46,41 @@ from mcp.server.auth.provider import AccessToken
 from mcp.server.lowlevel import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
+from .argument_limits import (
+    DEFAULT_ARGUMENT_LIMITS,
+    MAX_ARG_LIST_LENGTH,
+    MAX_ARG_STRING_LENGTH,
+    MAX_ARG_TOTAL_CHARS,
+    ArgumentLimits,
+    validate_argument_bounds,
+)
 from .elicitation import DeclinedError, ElicitationNotSupportedError
 from .registry import ToolRegistry, ToolSpec
 
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "DEFAULT_ARGUMENT_LIMITS",
+    "MAX_ARG_LIST_LENGTH",
+    "MAX_ARG_STRING_LENGTH",
+    "MAX_ARG_TOTAL_CHARS",
+    "ArgumentLimits",
+    "AsgiApp",
+    "AuditHook",
+    "ContextFactory",
+    "ErrorHandler",
+    "PrincipalResolver",
+    "RequestHook",
+    "SessionGuard",
+    "build_mcp_server",
+    "build_streamable_http_asgi_app",
+    "coerce_json_strings",
+    "current_request_context",
+    "default_error_handler",
+    "invoke_tool",
+    "usage_error_result",
+    "validate_argument_bounds",
+]
 
 current_request_context: ContextVar[Any] = ContextVar(
     "mcp_dynamic_tool_registration_request_context", default=None
@@ -132,18 +163,23 @@ def coerce_json_strings(value: Any) -> Any:
 
 
 def _validate_arguments(
-    input_schema: type[pydantic.BaseModel], arguments: dict[str, Any]
+    input_schema: type[pydantic.BaseModel],
+    arguments: dict[str, Any],
+    limits: ArgumentLimits = DEFAULT_ARGUMENT_LIMITS,
 ) -> str | None:
     """Validate raw tool-call *arguments* against *input_schema*; return an
     error message, or ``None`` if the arguments are acceptable.
 
-    Two checks, because tool input schemas commonly don't set
+    Three checks, because tool input schemas commonly don't set
     ``model_config = ConfigDict(extra="forbid")`` and pydantic v2's default
     is ``extra="ignore"``: (1) required/mistyped fields, via
-    ``model_validate`` itself, and (2) unknown keys, checked separately
+    ``model_validate`` itself, (2) unknown keys, checked separately
     against the model's field names/aliases — otherwise a typo'd kwarg
     (e.g. a misspelled field name) would validate cleanly and only
-    blow up later as a raw ``TypeError`` calling the handler.
+    blow up later as a raw ``TypeError`` calling the handler — and
+    (3) argument *sizes* against *limits* (pydantic validates shapes,
+    not magnitudes: unbounded strings/lists pass straight through), via
+    :func:`validate_argument_bounds`.
     """
     try:
         input_schema.model_validate(arguments)
@@ -157,6 +193,12 @@ def _validate_arguments(
     unexpected = set(arguments) - allowed
     if unexpected:
         return f"Unexpected argument(s): {', '.join(sorted(unexpected))}"
+
+    bounds_error = validate_argument_bounds(
+        arguments, limits, schema_name=input_schema.__name__
+    )
+    if bounds_error is not None:
+        return bounds_error
     return None
 
 
@@ -308,6 +350,7 @@ def build_mcp_server(
     error_handler: ErrorHandler | None = default_error_handler,
     coerce_args: bool = True,
     inject_context: bool = True,
+    argument_limits: ArgumentLimits | None = None,
 ) -> Server:
     """Build a low-level MCP ``Server`` whose tool list/dispatch are backed
     by *tool_registry*.
@@ -324,7 +367,15 @@ def build_mcp_server(
             validation (see :func:`coerce_json_strings`).
         inject_context: Pass ``current_request_context`` to handlers as the
             ``context`` keyword. Disable for handlers that take no context.
+        argument_limits: Size bounds enforced on tool-call arguments after
+            coercion and schema validation (see
+            :func:`validate_argument_bounds`); ``None`` means
+            :data:`DEFAULT_ARGUMENT_LIMITS`. Bounds are enforced
+            server-side only — they are deliberately *not* advertised in
+            the tools' ``inputSchema`` (``model_json_schema``), so a host
+            can tighten them without changing what clients see.
     """
+    limits = argument_limits or DEFAULT_ARGUMENT_LIMITS
     server: Server = Server(name)
 
     @server.list_tools()
@@ -370,7 +421,7 @@ def build_mcp_server(
         # mistake, not a server fault: answer with a normal isError result
         # instead of letting a TypeError from the handler call reach the SDK.
         if spec.input_schema is not None:
-            validation_error = _validate_arguments(spec.input_schema, arguments)
+            validation_error = _validate_arguments(spec.input_schema, arguments, limits)
             if validation_error is not None:
                 return types.CallToolResult(
                     content=[
@@ -440,6 +491,7 @@ def build_streamable_http_asgi_app(
     request_hook: RequestHook | None = None,
     principal_of: PrincipalResolver | None = None,
     session_guard: SessionGuard | None = None,
+    argument_limits: ArgumentLimits | None = None,
 ) -> tuple[AsgiApp, StreamableHTTPSessionManager]:
     """Build a bearer-token-gated Streamable HTTP ASGI app for one MCP server.
 
@@ -478,6 +530,7 @@ def build_streamable_http_asgi_app(
             per-request authorization state (token revocation, caller
             status) for the lifetime of a session, not just at
             ``initialize``. ``None`` (the default) guards nothing.
+        argument_limits: Passed through to :func:`build_mcp_server`.
     """
     mcp_server = build_mcp_server(
         name,
@@ -486,6 +539,7 @@ def build_streamable_http_asgi_app(
         error_handler=error_handler,
         coerce_args=coerce_args,
         inject_context=context_factory is not None,
+        argument_limits=argument_limits,
     )
     # Stateful (the SDK default): a session's ServerSession persists across
     # requests, so client_params negotiated at `initialize` survive into

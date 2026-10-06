@@ -765,6 +765,152 @@ class TestHooks:
         assert events == ["enter", "call", "exit"]
 
 
+class TestArgumentBounds:
+    """_call_tool must reject out-of-bounds arguments (sizes, not shapes)
+    as a clean isError result, before the audit hook or handler run."""
+
+    @staticmethod
+    def _echo_server(**limit_kwargs: Any) -> Server:
+        from pydantic import BaseModel
+
+        from mcp_dynamic_tool_registration.server_factory import ArgumentLimits
+
+        class EchoInput(BaseModel):
+            text: str
+
+        registry = ToolRegistry("demo")
+        registry.add_tool(
+            name="echo",
+            description="Echo.",
+            input_schema=EchoInput,
+            handler=lambda text, context=None: {"text": text},
+        )
+        return build_mcp_server(
+            "demo", registry, argument_limits=ArgumentLimits(**limit_kwargs)
+        )
+
+    def test_oversized_string_is_rejected_without_calling_handler(self):
+        from pydantic import BaseModel
+
+        from mcp_dynamic_tool_registration.server_factory import ArgumentLimits
+
+        class EchoInput(BaseModel):
+            text: str
+
+        called = MagicMock()
+        registry = ToolRegistry("demo")
+        registry.add_tool(
+            name="echo",
+            description="Echo.",
+            input_schema=EchoInput,
+            handler=lambda text, context=None: called() or {"text": text},
+        )
+        server = build_mcp_server(
+            "demo", registry, argument_limits=ArgumentLimits(max_string_length=10)
+        )
+
+        result = _call(server, "echo", {"text": "x" * 11})
+
+        assert result.isError is True
+        assert result.content[0].text.startswith("Invalid arguments for tool 'echo'")
+        assert "limit is 10" in result.content[0].text
+        called.assert_not_called()
+
+    def test_oversized_list_is_rejected(self):
+        from pydantic import BaseModel
+
+        from mcp_dynamic_tool_registration.server_factory import ArgumentLimits
+
+        class TagsInput(BaseModel):
+            tags: list[str] = []
+
+        called = MagicMock()
+        registry = ToolRegistry("demo")
+        registry.add_tool(
+            name="t",
+            description="",
+            input_schema=TagsInput,
+            handler=lambda tags, context=None: called() or {"ok": True},
+        )
+        server = build_mcp_server(
+            "demo", registry, argument_limits=ArgumentLimits(max_list_length=5)
+        )
+
+        result = _call(server, "t", {"tags": ["x"] * 6})
+
+        assert result.isError is True
+        assert "list-size limit" in result.content[0].text
+        called.assert_not_called()
+
+    def test_oversized_total_payload_is_rejected(self):
+        from pydantic import BaseModel
+
+        from mcp_dynamic_tool_registration.server_factory import ArgumentLimits
+
+        class PartsInput(BaseModel):
+            parts: list[str] = []
+
+        registry = ToolRegistry("demo")
+        registry.add_tool(
+            name="t",
+            description="",
+            input_schema=PartsInput,
+            handler=lambda parts, context=None: {"ok": True},
+        )
+        server = build_mcp_server(
+            "demo", registry, argument_limits=ArgumentLimits(max_total_chars=250)
+        )
+
+        result = _call(server, "t", {"parts": ["x" * 100, "y" * 100, "z" * 100]})
+
+        assert result.isError is True
+        assert "total argument-size limit" in result.content[0].text
+
+    def test_within_bounds_arguments_still_dispatch(self):
+        server = self._echo_server(max_string_length=100)
+        result = _call(server, "echo", {"text": "hi"})
+
+        assert result.isError is False
+        assert result.structuredContent == {"text": "hi"}
+
+    def test_custom_argument_limits_are_honored(self):
+        server = self._echo_server(max_string_length=10)
+        assert _call(server, "echo", {"text": "x" * 11}).isError is True
+        assert _call(server, "echo", {"text": "x" * 10}).isError is False
+
+    def test_audit_hook_is_not_invoked_for_out_of_bounds_arguments(self):
+        from mcp_dynamic_tool_registration.server_factory import ArgumentLimits
+
+        audit_calls: list[dict[str, Any]] = []
+
+        async def audit_hook(**kwargs: Any) -> Any:
+            audit_calls.append(kwargs)
+            return {"audited": True}
+
+        from pydantic import BaseModel
+
+        class EchoInput(BaseModel):
+            text: str
+
+        registry = ToolRegistry("demo")
+        registry.add_tool(
+            name="echo",
+            description="Echo.",
+            input_schema=EchoInput,
+            handler=lambda text, context=None: {"text": text},
+        )
+        server = build_mcp_server(
+            "demo",
+            registry,
+            audit_hook=audit_hook,
+            argument_limits=ArgumentLimits(max_string_length=10),
+        )
+        result = _call(server, "echo", {"text": "x" * 50})
+
+        assert result.isError is True
+        assert audit_calls == []
+
+
 class TestDefaultErrorHandler:
     def test_plain_exception_is_not_handled(self):
         assert default_error_handler("t", ValueError("x")) is None

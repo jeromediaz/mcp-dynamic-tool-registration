@@ -192,7 +192,9 @@ class TestGuardRunsOnEveryRequest:
             session_guard=guard, principal_of=lambda payload: payload["uid"]
         ):
             session_id = _open_session(client, "token-alice")
-            assert _post(client, "token-alice", _LIST_TOOLS, session_id).status_code == 200
+            assert (
+                _post(client, "token-alice", _LIST_TOOLS, session_id).status_code == 200
+            )
 
             assert [token for token, _ in calls] == [
                 "token-alice",  # initialize

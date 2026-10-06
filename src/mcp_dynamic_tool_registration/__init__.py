@@ -1,5 +1,13 @@
 """MCP Dynamic Tool Registration — registry-first tool registration for MCP servers."""
 
+from .argument_limits import (
+    DEFAULT_ARGUMENT_LIMITS,
+    MAX_ARG_LIST_LENGTH,
+    MAX_ARG_STRING_LENGTH,
+    MAX_ARG_TOTAL_CHARS,
+    ArgumentLimits,
+    validate_argument_bounds,
+)
 from .elicitation import (
     DeclinedError,
     ElicitationNotSupportedError,
@@ -41,6 +49,11 @@ from .tool_decorator import (
 __version__ = "0.1.0"
 
 __all__: list[str] = [
+    "DEFAULT_ARGUMENT_LIMITS",
+    "MAX_ARG_LIST_LENGTH",
+    "MAX_ARG_STRING_LENGTH",
+    "MAX_ARG_TOTAL_CHARS",
+    "ArgumentLimits",
     "AsgiApp",
     "AuditHook",
     "ContextFactory",
@@ -68,4 +81,5 @@ __all__: list[str] = [
     "register_tools",
     "resolve_server_name",
     "usage_error_result",
+    "validate_argument_bounds",
 ]
