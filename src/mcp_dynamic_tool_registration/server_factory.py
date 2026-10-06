@@ -72,6 +72,12 @@ type PrincipalResolver = Callable[[Any], str]
 """Returns a stable identifier of the caller (e.g. a user id) from a
 validated token payload. MCP sessions are bound to it."""
 
+type SessionGuard = Callable[[str, Any], None]
+"""Called as ``(raw_bearer_token, host_context)`` on every authenticated
+HTTP request, just before it is handled. Any exception it raises means
+"unauthorized" (401) — unlike ``request_hook``, whose failures are logged
+and never affect the request. See ``build_streamable_http_asgi_app``."""
+
 
 class AuditHook(Protocol):
     """Wraps a tool call. Must perform the call itself (typically through
@@ -433,6 +439,7 @@ def build_streamable_http_asgi_app(
     coerce_args: bool = True,
     request_hook: RequestHook | None = None,
     principal_of: PrincipalResolver | None = None,
+    session_guard: SessionGuard | None = None,
 ) -> tuple[AsgiApp, StreamableHTTPSessionManager]:
     """Build a bearer-token-gated Streamable HTTP ASGI app for one MCP server.
 
@@ -461,6 +468,16 @@ def build_streamable_http_asgi_app(
             not exist (404). Defaults to a SHA-256 of the bearer token, which
             binds a session to the exact token that created it. An exception
             raised here is treated like an invalid token (401).
+        session_guard: Called as ``(raw_bearer_token, host_context)`` on
+            EVERY HTTP request that reaches the ASGI app after the token
+            validates — including follow-up requests on an already-open
+            session, whose JSON-RPC frames are otherwise forwarded to the
+            session's persistent task without any re-validation. Unlike
+            *request_hook*, an exception raised here rejects the request:
+            it is answered like an invalid token (401). Use it to re-check
+            per-request authorization state (token revocation, caller
+            status) for the lifetime of a session, not just at
+            ``initialize``. ``None`` (the default) guards nothing.
     """
     mcp_server = build_mcp_server(
         name,
@@ -531,6 +548,26 @@ def build_streamable_http_asgi_app(
             if context_factory is not None
             else None
         )
+        # When a session guard is configured, the per-request context is
+        # published BEFORE it runs (and reset on every exit path) so the
+        # guard can inspect the live MCP frame — e.g. reject a tool call
+        # whose caller was deactivated since the session opened. The
+        # session's own persistent task keeps the snapshot it inherited
+        # when the session was created; this per-request set/reset never
+        # mutates it. Without a guard, the behavior is unchanged: the
+        # context is published right before the request is handled.
+        try:
+            if session_guard is not None:
+                session_guard(token, current_request_context.get())
+        except Exception:
+            if var_token is not None:
+                current_request_context.reset(var_token)
+            logger.info(
+                "MCP request rejected: session guard declined for server=%s", name
+            )
+            await _send_json_error(send, 401, "Invalid or unauthorized token")
+            return
+
         try:
             if request_hook is not None:
                 try:

@@ -502,9 +502,10 @@ library imports nothing from your framework.
 | `request_hook` | `(server_name, mcp_session_id, http_method) -> None` | ASGI app only: called for each **authenticated** request, after the token validates and after the context is set, just before `handle_request`. Detection only (metrics/spans); exceptions are logged and swallowed so a broken hook never affects the request. |
 | `principal_of` | `(token_payload) -> str` | ASGI app only: the caller id each MCP session is bound to (see *Authentication*). Defaults to a SHA-256 of the bearer token. |
 | `context_factory` | `(token_payload) -> context` | ASGI app only: builds the per-request context from the validated payload and publishes it on `current_request_context`. `None` means no context is published and handlers are built without `context` injection (`inject_context=False` on `build_mcp_server`). |
+| `session_guard` | `(raw_bearer_token, host_context) -> None` | ASGI app only: called on **every** authenticated HTTP request, after the token validates and before it is handled — including follow-up requests on an already-open session. Unlike `request_hook`, whose failures are logged and swallowed, any exception it raises rejects the request like an invalid token (401). Use it to re-check per-request authorization (token revocation, caller status) for the session's whole lifetime. `None` (the default) guards nothing. |
 
-The types `AuditHook`, `ContextFactory`, `ErrorHandler`, `PrincipalResolver` and `RequestHook` are
-exported for annotating your own wrappers. `current_request_context` is the
+The types `AuditHook`, `ContextFactory`, `ErrorHandler`, `PrincipalResolver`, `RequestHook` and
+`SessionGuard` are exported for annotating your own wrappers. `current_request_context` is the
 underlying `ContextVar`, exposed for hosts (and tests) that want to inspect or
 set it directly.
 
@@ -516,12 +517,12 @@ import mcp_dynamic_tool_registration as m
 print(sorted(m.__all__))
 # ['AsgiApp', 'AuditHook', 'ContextFactory', 'DeclinedError',
 #  'ElicitationNotSupportedError', 'ErrorHandler', 'McpServerRegistry',
-#  'PrincipalResolver', 'RequestHook', 'ServerRegistry', 'ToolEnabledCallback', 'ToolRegistry',
-#  'ToolSpec', 'build_mcp_server', 'build_streamable_http_asgi_app',
-#  'coerce_json_strings', 'confirm_destructive', 'current_request_context',
-#  'default_error_handler', 'invoke_tool', 'is_register_tool', 'register_tool',
-#  'register_tool_module', 'register_tools', 'resolve_server_name',
-#  'usage_error_result']
+#  'PrincipalResolver', 'RequestHook', 'ServerRegistry', 'SessionGuard',
+#  'ToolEnabledCallback', 'ToolRegistry', 'ToolSpec', 'build_mcp_server',
+#  'build_streamable_http_asgi_app', 'coerce_json_strings',
+#  'confirm_destructive', 'current_request_context', 'default_error_handler',
+#  'invoke_tool', 'is_register_tool', 'register_tool', 'register_tool_module',
+#  'register_tools', 'resolve_server_name', 'usage_error_result']
 ```
 
 A complete hooks example — an `audit_hook` that dispatches on the
