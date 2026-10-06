@@ -602,6 +602,111 @@ class TestCallToolCoercion:
         assert result.root.isError is True
         called.assert_not_called()
 
+    def test_scalar_body_starting_with_brace_reaches_handler_verbatim(self):
+        from pydantic import BaseModel
+
+        class NoteInput(BaseModel):
+            title: str
+            body: str = ""
+
+        captured = {}
+
+        def handler(context=None, **kwargs):
+            captured.update(kwargs)
+            return {"ok": True}
+
+        registry = ToolRegistry("demo")
+        registry.add_tool(
+            name="create_note",
+            description="",
+            input_schema=NoteInput,
+            handler=handler,
+        )
+        server = build_mcp_server("demo", registry)
+
+        call_tool_handler = server.request_handlers[types.CallToolRequest]
+        request = types.CallToolRequest(
+            method="tools/call",
+            params=types.CallToolRequestParams(
+                name="create_note",
+                arguments={"title": "t", "body": '{"a": 1}'},
+            ),
+        )
+        result = asyncio.run(call_tool_handler(request))
+
+        assert result.root.isError is False
+        assert captured["body"] == '{"a": 1}'
+
+    def test_nested_scalar_field_not_double_decoded(self):
+        from pydantic import BaseModel
+
+        class NoteInput(BaseModel):
+            title: str
+            tags: list[str] | None = None
+
+        captured = {}
+
+        def handler(context=None, **kwargs):
+            captured.update(kwargs)
+            return {"ok": True}
+
+        registry = ToolRegistry("demo")
+        registry.add_tool(
+            name="create_note",
+            description="",
+            input_schema=NoteInput,
+            handler=handler,
+        )
+        server = build_mcp_server("demo", registry)
+
+        call_tool_handler = server.request_handlers[types.CallToolRequest]
+        request = types.CallToolRequest(
+            method="tools/call",
+            params=types.CallToolRequestParams(
+                name="create_note",
+                arguments={"title": '["a"]', "tags": ["x", "y"]},
+            ),
+        )
+        result = asyncio.run(call_tool_handler(request))
+
+        assert result.root.isError is False
+        assert captured["title"] == '["a"]'
+
+    def test_double_encoded_list_under_container_field_still_coerced(self):
+        from pydantic import BaseModel
+
+        class NoteInput(BaseModel):
+            title: str
+            tags: list[str] | None = None
+
+        captured = {}
+
+        def handler(context=None, **kwargs):
+            captured.update(kwargs)
+            return {"ok": True}
+
+        registry = ToolRegistry("demo")
+        registry.add_tool(
+            name="create_note",
+            description="",
+            input_schema=NoteInput,
+            handler=handler,
+        )
+        server = build_mcp_server("demo", registry)
+
+        call_tool_handler = server.request_handlers[types.CallToolRequest]
+        request = types.CallToolRequest(
+            method="tools/call",
+            params=types.CallToolRequestParams(
+                name="create_note",
+                arguments={"title": "test", "tags": '["a", "b", "c"]'},
+            ),
+        )
+        result = asyncio.run(call_tool_handler(request))
+
+        assert result.root.isError is False
+        assert captured["tags"] == ["a", "b", "c"]
+
 
 class TestHooks:
     def test_inject_context_false_calls_handler_without_context(self):

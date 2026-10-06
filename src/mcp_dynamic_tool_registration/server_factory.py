@@ -10,7 +10,9 @@ imports:
   the ``context`` keyword (set by the host / the ASGI app for each request).
 - ``audit_hook``: wraps every tool call (e.g. to persist an audit log).
 - ``error_handler``: turns expected usage errors into ``isError`` results.
-- ``coerce_args``: tolerate double-encoded JSON arguments from LLM clients.
+- ``coerce_args``: tolerate double-encoded JSON arguments from LLM clients,
+  guided by each tool's input schema (strings are decoded only where the
+  field's declared type admits an object or array).
 
 Also holds the pure helpers shared with the ASGI app: JSON argument
 coercion, argument validation, the usage-error result builder, the
@@ -144,6 +146,12 @@ def coerce_json_strings(value: Any) -> Any:
     strings that merely *contain* JSON-like characters are left alone.
     If the string doesn't parse as a JSON container it is returned
     unchanged so the normal Pydantic error message is still produced.
+
+    This walker is schema-less: it rewrites *any* JSON-container-looking
+    string.  Tools registered with an input schema go through
+    :func:`coerce_json_strings_with_schema` instead, which decodes strings
+    only where the field's declared type admits an object or array, so
+    scalar-typed fields are never rebound to containers.
     """
     if isinstance(value, str):
         stripped = value.lstrip()
@@ -160,6 +168,281 @@ def coerce_json_strings(value: Any) -> Any:
     elif isinstance(value, dict):
         return {k: coerce_json_strings(v) for k, v in value.items()}
     return value
+
+
+def _resolve_ref(ref: str, defs: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Resolve a local ``#/$defs/Name`` reference against *defs*; return the
+    referenced schema, or an empty dict when the reference is unresolvable."""
+    prefix = "#/$defs/"
+    if ref.startswith(prefix):
+        target = defs.get(ref[len(prefix) :])
+        if isinstance(target, dict):
+            return target
+    return {}
+
+
+def _types_from_schema(
+    schema: Any, defs: dict[str, dict[str, Any]], seen: set[str]
+) -> set[str]:
+    """Derive the set of JSON type names a (possibly compound) JSON schema
+    admits.  Total: any unrecognized shape yields ``{"any"}`` (free-form) so
+    callers degrade to permissive coercion rather than raising."""
+    if not isinstance(schema, dict) or schema is True or schema == {}:
+        return {"any"}
+
+    ref = schema.get("$ref")
+    if isinstance(ref, str):
+        return _types_from_resolved_ref(ref, defs, seen)
+
+    members = schema.get("anyOf")
+    if members is None:
+        members = schema.get("oneOf")
+    if isinstance(members, list):
+        return _union_member_types(members, defs, seen)
+
+    typ = schema.get("type")
+    if isinstance(typ, list):
+        return {str(t) for t in typ}
+    if isinstance(typ, str):
+        return {typ}
+
+    enum = schema.get("enum")
+    if isinstance(enum, list):
+        return _types_from_enum(enum)
+
+    return {"any"}
+
+
+def _types_from_resolved_ref(
+    ref: str, defs: dict[str, dict[str, Any]], seen: set[str]
+) -> set[str]:
+    """Types admitted by the schema ``$ref`` points at.  Re-entering a ref
+    means a recursive model: assume it admits containers.  The ``seen`` guard
+    keeps resolution terminating because every step consumes a ref."""
+    if ref in seen:
+        return {"object"}
+    target = _resolve_ref(ref, defs)
+    if not target:
+        return {"any"}
+    return _types_from_schema(target, defs, seen | {ref})
+
+
+def _union_member_types(
+    members: list[Any], defs: dict[str, dict[str, Any]], seen: set[str]
+) -> set[str]:
+    """Union of the types admitted by every ``anyOf``/``oneOf`` member."""
+    result: set[str] = set()
+    for member in members:
+        result |= _types_from_schema(member, defs, seen)
+    return result
+
+
+def _types_from_enum(enum: list[Any]) -> set[str]:
+    """Types of the enum's member values (e.g. a dict member admits an
+    object), so an enum-typed field is treated by what it can hold."""
+    result: set[str] = set()
+    for item in enum:
+        if isinstance(item, dict):
+            result.add("object")
+        elif isinstance(item, list):
+            result.add("array")
+        elif item is None:
+            result.add("null")
+        elif isinstance(item, bool):
+            result.add("boolean")
+        elif isinstance(item, (int, float)):
+            result.add("number")
+        else:
+            result.add("string")
+    return result
+
+
+def _json_types_for_field(
+    field_schema: dict[str, Any], defs: dict[str, dict[str, Any]], seen: set[str]
+) -> set[str]:
+    """The JSON types the field's schema admits (see
+    :func:`_types_from_schema` for the union/ref rules).  ``{"any"}`` means
+    free-form: coercion is allowed because any decoded shape would
+    validate."""
+    return _types_from_schema(field_schema, defs, seen)
+
+
+def _field_admits_containers(types_admitted: set[str]) -> bool:
+    """Whether a field whose schema admits *types_admitted* may legitimately
+    receive an object or array.  ``"any"`` (free-form) counts as admitting."""
+    return "any" in types_admitted or bool(types_admitted & {"object", "array"})
+
+
+def _schema_walk(value: Any, schema: Any, defs: dict[str, dict[str, Any]]) -> Any:
+    """Recursively coerce double-encoded JSON strings inside *value*, guided
+    by the JSON Schema node *schema* that describes it.  A string is decoded
+    only when its schema admits an object or array and the string parses as
+    one; anything else is returned unchanged."""
+    schema = _normalize_schema(schema, defs)
+
+    if isinstance(value, str):
+        return _schema_walk_str(value, schema, defs)
+    if isinstance(value, list):
+        return _schema_walk_list(value, schema, defs)
+    if isinstance(value, dict):
+        return _schema_walk_dict(value, schema, defs)
+    return value
+
+
+def _schema_walk_str(value: str, schema: Any, defs: dict[str, dict[str, Any]]) -> Any:
+    """Decode *value* under *schema* when its declared type admits a
+    container, the string starts with ``[``/``{``, and it parses as a JSON
+    container; otherwise return it unchanged so normal validation happens."""
+    if not _field_admits_containers(_types_from_schema(schema, defs, set())):
+        return value
+    stripped = value.lstrip()
+    if not stripped or stripped[0] not in ("[", "{"):
+        return value
+    try:
+        parsed = json.loads(value)
+    except (json.JSONDecodeError, ValueError):
+        return value
+    if isinstance(parsed, (list, dict)):
+        return _schema_walk(parsed, schema, defs)
+    return value
+
+
+def _schema_walk_list(
+    value: list[Any], schema: Any, defs: dict[str, dict[str, Any]]
+) -> list[Any]:
+    """Walk list items under the schema's ``items`` node (or the positional
+    member schemas when ``items`` is a list, as pydantic emits for tuples)."""
+    item_schema: Any = None
+    positional: list[Any] | None = None
+    if isinstance(schema, dict):
+        items = schema.get("items")
+        if isinstance(items, list):
+            positional = items
+        elif items is not None:
+            item_schema = items
+    out: list[Any] = []
+    for i, item in enumerate(value):
+        member = positional[i] if positional and i < len(positional) else item_schema
+        out.append(_schema_walk(item, member, defs))
+    return out
+
+
+def _schema_walk_dict(
+    value: dict[str, Any], schema: Any, defs: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    """Walk dict values under the schema's ``properties``; keys with no
+    matching property descend into the union members' schemas
+    (``anyOf``/``oneOf``) or fall back to ``additionalProperties``."""
+    properties: dict[str, Any] = {}
+    additional: Any = None
+    member_schemas: list[dict[str, Any]] = []
+    if isinstance(schema, dict):
+        props = schema.get("properties")
+        if isinstance(props, dict):
+            properties = props
+        additional = schema.get("additionalProperties")
+        for key in ("anyOf", "oneOf"):
+            members = schema.get(key)
+            if isinstance(members, list):
+                member_schemas.extend(m for m in members if isinstance(m, dict))
+    result: dict[str, Any] = {}
+    for k, v in value.items():
+        if k in properties:
+            result[k] = _schema_walk(v, properties[k], defs)
+        elif member_schemas:
+            merged: Any = v
+            for member in member_schemas:
+                merged = _schema_walk(merged, member, defs)
+            result[k] = merged
+        elif additional is None:
+            result[k] = v
+        else:
+            result[k] = _schema_walk(v, additional, defs)
+    return result
+
+
+def _normalize_schema(schema: Any, defs: dict[str, dict[str, Any]]) -> Any:
+    """Replace a ``$ref`` node with its target (one level; the recursion here
+    is guarded by the schema tree itself); pass non-dict schemas through."""
+    if isinstance(schema, dict) and isinstance(schema.get("$ref"), str):
+        return _resolve_ref(schema["$ref"], defs)
+    return schema
+
+
+def coerce_json_strings_with_schema(
+    value: Any, input_schema: type[pydantic.BaseModel] | None
+) -> Any:
+    """Schema-guided variant of :func:`coerce_json_strings` for tool-call
+    arguments.
+
+    A string that looks like JSON is decoded only where the tool's input
+    schema says the value may be an object or array (free-form fields count
+    as admitting).  Fields whose declared type is a scalar — ``str``, or a
+    union like ``str | None`` — are never rewritten, so a correctly-sent
+    string such as ``"{\\"a\\": 1}"`` for a ``str`` field reaches validation
+    and the handler verbatim instead of being silently turned into a dict.
+
+    Args:
+        value: The raw ``arguments`` payload of a tool call.
+        input_schema: The tool's input model; ``None`` (a tool registered
+            without a schema) falls back to the legacy schema-less walker.
+
+    The JSON schema is built once per call; ``$ref`` resolution guards
+    against recursive models by assuming they admit containers.
+    """
+    if input_schema is None:
+        return coerce_json_strings(value)
+    if not isinstance(value, dict):
+        return value
+
+    root: Any = input_schema.model_json_schema()
+    root = root if isinstance(root, dict) else {}
+    defs_value = root.get("$defs")
+    defs: dict[str, dict[str, Any]] = defs_value if isinstance(defs_value, dict) else {}
+    properties = root.get("properties")
+    properties = properties if isinstance(properties, dict) else {}
+
+    # Field lookup keyed by both the field name and its alias — mirrors how
+    # _validate_arguments builds its allowed-keys map.  Unknown keys are left
+    # untouched; validation rejects them anyway.
+    field_by_key: dict[str, dict[str, Any]] = {}
+    for name, field in input_schema.model_fields.items():
+        schema_node = properties.get(name)
+        if isinstance(schema_node, dict):
+            field_by_key[name] = schema_node
+        if field.alias:
+            alias_node = properties.get(field.alias)
+            if isinstance(alias_node, dict):
+                field_by_key[field.alias] = alias_node
+
+    result: dict[str, Any] = {}
+    for k, v in value.items():
+        field_schema = field_by_key.get(k)
+        if field_schema is None:
+            # Unknown keys are left unchanged; validation rejects them anyway.
+            result[k] = v
+            continue
+        types_admitted = _json_types_for_field(field_schema, defs, set())
+        if isinstance(v, str):
+            if not _field_admits_containers(types_admitted):
+                result[k] = v
+                continue
+            stripped = v.lstrip()
+            if stripped and stripped[0] in ("[", "{"):
+                try:
+                    parsed = json.loads(v)
+                except (json.JSONDecodeError, ValueError):
+                    result[k] = v
+                    continue
+                if isinstance(parsed, (list, dict)):
+                    result[k] = _schema_walk(parsed, field_schema, defs)
+                    continue
+            result[k] = v
+        elif isinstance(v, (list, dict)):
+            result[k] = _schema_walk(v, field_schema, defs)
+        else:
+            result[k] = v
+    return result
 
 
 def _validate_arguments(
@@ -364,7 +647,10 @@ def build_mcp_server(
         error_handler: Maps handler exceptions to tool results; ``None``
             disables the mapping (every exception propagates to the SDK).
         coerce_args: Parse JSON-container strings in arguments before
-            validation (see :func:`coerce_json_strings`).
+            validation, guided by ``spec.input_schema`` (see
+            :func:`coerce_json_strings_with_schema`): strings are decoded
+            only where the field's declared type admits an object or
+            array.
         inject_context: Pass ``current_request_context`` to handlers as the
             ``context`` keyword. Disable for handlers that take no context.
         argument_limits: Size bounds enforced on tool-call arguments after
@@ -413,9 +699,12 @@ def build_mcp_server(
             raise ValueError(f"Unknown tool: {tool_name}")
 
         # Coerce before both validation and the handler call so the coerced
-        # values are what actually reach the handler.
+        # values are what actually reach the handler. Coercion is schema-
+        # guided: JSON-looking strings are decoded only for fields whose
+        # declared type admits an object or array, so a scalar-typed field
+        # never has its string value silently rewritten into a container.
         if coerce_args:
-            arguments = coerce_json_strings(arguments)
+            arguments = coerce_json_strings_with_schema(arguments, spec.input_schema)
 
         # Malformed arguments (unknown/missing/mistyped fields) are a caller
         # mistake, not a server fault: answer with a normal isError result

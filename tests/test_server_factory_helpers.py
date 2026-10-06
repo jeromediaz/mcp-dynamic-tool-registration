@@ -16,6 +16,7 @@ from mcp_dynamic_tool_registration.server_factory import (
     _extract_header,
     _validate_arguments,
     coerce_json_strings,
+    coerce_json_strings_with_schema,
     usage_error_result,
 )
 
@@ -82,6 +83,119 @@ class TestCoerceJsonStrings:
     def test_whitespace_padded_json_array_coerced(self):
         result = coerce_json_strings("  [1, 2, 3]  ")
         assert result == [1, 2, 3]
+
+
+class TestSchemaAwareCoercion:
+    """Unit tests for coerce_json_strings_with_schema — coercion guided by
+    the tool's input schema: JSON-looking strings are decoded only for
+    fields whose declared type admits an object or array."""
+
+    def test_scalar_string_field_starting_with_brace_is_untouched(self):
+        from pydantic import BaseModel
+
+        class In(BaseModel):
+            body: str
+
+        result = coerce_json_strings_with_schema({"body": '{"a": 1}'}, In)
+        assert result["body"] == '{"a": 1}'
+
+    def test_scalar_str_field_with_invalid_json_unchanged_and_validates(self):
+        from pydantic import BaseModel
+
+        class In(BaseModel):
+            body: str
+
+        result = coerce_json_strings_with_schema({"body": "[not valid json"}, In)
+        assert result["body"] == "[not valid json"
+        assert In.model_validate(result).body == "[not valid json"
+
+    def test_container_field_double_encoded_is_still_coerced(self):
+        from pydantic import BaseModel
+
+        class In(BaseModel):
+            tags: list[str] | None = None
+
+        result = coerce_json_strings_with_schema({"tags": '["a", "b"]'}, In)
+        assert result["tags"] == ["a", "b"]
+
+    def test_optional_scalar_union_field_is_not_coerced(self):
+        from pydantic import BaseModel
+
+        class In(BaseModel):
+            note_type: str | None = None
+
+        result = coerce_json_strings_with_schema({"note_type": '{"a": 1}'}, In)
+        assert result["note_type"] == '{"a": 1}'
+        assert In.model_validate(result).note_type == '{"a": 1}'
+
+    def test_int_list_string_under_scalar_field_is_not_mangled(self):
+        from pydantic import BaseModel
+
+        class In(BaseModel):
+            note_id: str
+
+        result = coerce_json_strings_with_schema({"note_id": "[42]"}, In)
+        assert result == {"note_id": "[42]"}
+
+    def test_nested_model_string_fields_not_coerced_but_container_slots_are(self):
+        from pydantic import BaseModel
+
+        class RelationEntry(BaseModel):
+            predicate: str
+            target_id: str
+
+        class In(BaseModel):
+            relations: list[RelationEntry] | None = None
+
+        # Case 1: already-valid list — the scalar sub-field target_id must
+        # not be rewritten even though its value looks like JSON.
+        result = coerce_json_strings_with_schema(
+            {"relations": [{"predicate": "references", "target_id": '["a"]'}]}, In
+        )
+        assert result["relations"] == [
+            {"predicate": "references", "target_id": '["a"]'}
+        ]
+
+        # Case 2: the whole list is double-encoded — it is parsed, but the
+        # inner scalar target_id stays a literal string.
+        encoded = json.dumps([{"predicate": "references", "target_id": '["a"]'}])
+        result = coerce_json_strings_with_schema({"relations": encoded}, In)
+        assert result["relations"] == [
+            {"predicate": "references", "target_id": '["a"]'}
+        ]
+
+    def test_scalar_field_json_scalar_string_unchanged(self):
+        from pydantic import BaseModel
+
+        class In(BaseModel):
+            a: str
+
+        result = coerce_json_strings_with_schema({"a": "42"}, In)
+        assert result["a"] == "42"
+
+    def test_no_schema_falls_back_to_legacy_walker(self):
+        assert coerce_json_strings_with_schema({"a": "[1, 2]"}, None) == {"a": [1, 2]}
+
+    def test_alias_field_is_coerced_per_its_own_type(self):
+        from pydantic import BaseModel, ConfigDict, Field
+
+        class In(BaseModel):
+            model_config = ConfigDict(populate_by_name=True)
+            tags: list[str] = Field(alias="tagsAlias")
+
+        result = coerce_json_strings_with_schema({"tagsAlias": '["x"]'}, In)
+        assert result["tagsAlias"] == ["x"]
+
+    def test_any_typed_field_is_coerced(self):
+        from typing import Any
+
+        from pydantic import BaseModel
+
+        class In(BaseModel):
+            payload: Any = None
+
+        result = coerce_json_strings_with_schema({"payload": '{"a":1}'}, In)
+        assert result["payload"] == {"a": 1}
 
 
 class TestExtractBearerToken:
