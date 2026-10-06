@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 
+import pydantic
 from mcp import types
 from pydantic import BaseModel
 
 from mcp_dynamic_tool_registration.server_factory import (
+    _MAX_ERROR_DETAIL_CHARS,
     DEFAULT_ARGUMENT_LIMITS,
     ArgumentLimits,
     AsgiApp,
@@ -19,6 +22,8 @@ from mcp_dynamic_tool_registration.server_factory import (
     coerce_json_strings_with_schema,
     usage_error_result,
 )
+
+LOGGER_NAME = "mcp_dynamic_tool_registration.server_factory"
 
 
 class TestCoerceJsonStrings:
@@ -307,14 +312,55 @@ class TestUsageErrorResult:
         assert isinstance(text, str)
         assert text.startswith("Tool 'x' error: ")
 
+    def test_oversized_detail_is_clamped(self):
+        """An over-long detail (e.g. one carrying error internals) must be
+        truncated to the client-visible cap — never streamed to the client
+        in full."""
+        exc = ValueError("boom")
+        exc.detail = "d" * (_MAX_ERROR_DETAIL_CHARS + 1000)  # type: ignore[attr-defined]
+        result = usage_error_result("x", exc)
+        text = result.content[0].text
+        assert text.startswith("Tool 'x' error: ")
+        assert len(text) == len("Tool 'x' error: ") + _MAX_ERROR_DETAIL_CHARS
+
+    def test_detail_at_exactly_the_limit_is_not_truncated(self):
+        exc = ValueError("boom")
+        exc.detail = "d" * _MAX_ERROR_DETAIL_CHARS  # type: ignore[attr-defined]
+        result = usage_error_result("x", exc)
+        assert (
+            result.content[0].text == "Tool 'x' error: " + "d" * _MAX_ERROR_DETAIL_CHARS
+        )
+
+    def test_logs_full_detail_with_traceback_at_warning(self, caplog):
+        """The message (full untruncated detail) and the traceback go to
+        the log even though the client only receives the clamp — the
+        server-side/client-side detail split this function exists for."""
+        exc = ValueError("secret internals " * 500)
+        with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
+            usage_error_result("x", exc)
+        # The 4k client cap is far shorter than this message, so a log line
+        # containing all of it can only be the full-detail server-side copy.
+        assert len(str(exc)) > _MAX_ERROR_DETAIL_CHARS
+        assert caplog.text.count("secret internals") > _MAX_ERROR_DETAIL_CHARS // 17
+        (record,) = [
+            r
+            for r in caplog.records
+            if r.name == "mcp_dynamic_tool_registration.server_factory"
+        ]
+        assert record.levelno == logging.WARNING
+        assert record.exc_info is not None
+        assert record.exc_info[1] is exc
+
 
 class _EchoInput(BaseModel):
     text: str
 
 
 class TestValidateArguments:
-    """_validate_arguments: shape checks (pydantic + unknown keys) keep
-    their messages, and argument bounds run last."""
+    """_validate_arguments: a mistyped field carries the exception object
+    itself (so the dispatch renders a client-safe summary and logs the full
+    detail), unknown-key and bounds failures stay plain strings, and
+    argument bounds run last."""
 
     def test_in_bounds_arguments_return_none(self):
         assert (
@@ -333,15 +379,19 @@ class TestValidateArguments:
         error = _validate_arguments(_EchoInput, {"text": "hi", "nope": 1})
         assert error == "Unexpected argument(s): nope"
 
-    def test_pydantic_message_unchanged(self):
+    def test_pydantic_failure_returns_the_validation_error(self):
+        """A shape failure must surface as the ``ValidationError`` itself,
+        not its rendered text: the rendered form embeds the caller's input
+        values and model internals, which the client is not supposed to
+        see."""
         error = _validate_arguments(_EchoInput, {})
-        assert error is not None
-        assert "Field required" in error
+        assert isinstance(error, pydantic.ValidationError)
+        assert any(err["loc"] == ("text",) for err in error.errors())
 
     def test_shape_checks_win_over_bounds(self):
         # A bad shape AND an oversized value: the shape error is reported.
         error = _validate_arguments(
             _EchoInput, {"text": 123}, ArgumentLimits(max_string_length=1)
         )
-        assert error is not None
-        assert "string_type" in error
+        assert isinstance(error, pydantic.ValidationError)
+        assert any(err["type"] == "string_type" for err in error.errors())

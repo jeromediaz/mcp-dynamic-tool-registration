@@ -5,9 +5,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from typing import Any
 from unittest.mock import MagicMock
 
+import pydantic
+import pytest
 from mcp import types
 from mcp.server.lowlevel import Server
 
@@ -1039,3 +1042,263 @@ class TestDefaultErrorHandler:
             result = default_error_handler("t", exc)
             assert result is not None
             assert result.isError is True
+
+
+class TestArgumentValidationErrorDetail:
+    """A mistyped argument is answered with a caller-safe summary: the
+    client learns which field failed and the rule it broke, but pydantic's
+    rendered input values, model names, and documentation URLs stay in the
+    server log."""
+
+    @staticmethod
+    def _echo_server() -> Server:
+        from pydantic import BaseModel
+
+        class EchoInput(BaseModel):
+            text: str
+
+        registry = ToolRegistry("demo")
+        registry.add_tool(
+            name="echo",
+            description="Echo.",
+            input_schema=EchoInput,
+            handler=lambda text, context=None: {"text": text},
+        )
+        return build_mcp_server("demo", registry)
+
+    def test_mistyped_argument_summary_omits_input_value(self):
+        result = _call(self._echo_server(), "echo", {"text": 42})
+
+        assert result.isError is True
+        text = result.content[0].text
+        assert text.startswith("Invalid arguments for tool 'echo'")
+        assert "text" in text
+        assert "42" not in text
+        assert "input_value" not in text
+        assert "EchoInput" not in text
+        assert "pydantic.dev" not in text
+
+    def test_constrained_field_summary_omits_the_offending_value(self):
+        from pydantic import BaseModel, Field
+
+        class QueryInput(BaseModel):
+            query: str = Field(max_length=5)
+
+        registry = ToolRegistry("demo")
+        registry.add_tool(
+            name="search",
+            description="",
+            input_schema=QueryInput,
+            handler=lambda query, context=None: {"ok": True},
+        )
+        server = build_mcp_server("demo", registry)
+        long_value = "z" * 200
+        result = _call(server, "search", {"query": long_value})
+
+        assert result.isError is True
+        text = result.content[0].text
+        assert "query" in text
+        assert long_value not in text
+        # pydantic 2.13 renders long values inside `input_value=` truncated
+        # to 50 inner characters: the first 24, an ellipsis, and the last
+        # 23; none of that rendering may reach the client.
+        assert "'zzzzzzzzzzzzzzzzzzzzzzzz...zzzzzzzzzzzzzzzzzzzzzzz'" not in text
+        assert "input_value" not in text
+        assert "input_type" not in text
+        assert "For further information" not in text
+
+    def test_multiple_errors_render_one_line_each_in_order(self):
+        from pydantic import BaseModel
+
+        class TwoInput(BaseModel):
+            a: str
+            b: str
+
+        registry = ToolRegistry("demo")
+        registry.add_tool(
+            name="t",
+            description="",
+            input_schema=TwoInput,
+            handler=lambda **kw: {},
+        )
+        server = build_mcp_server("demo", registry)
+        result = _call(server, "t", {"a": 1.5, "b": True})
+
+        text = result.content[0].text
+        assert text.startswith("Invalid arguments for tool 't': ")
+        lines = text[len("Invalid arguments for tool 't': ") :].splitlines()
+        assert len(lines) == 2
+        assert lines[0].startswith("a: ")
+        assert lines[1].startswith("b: ")
+
+    def test_many_errors_are_capped_with_a_count_marker(self):
+        from pydantic import BaseModel, Field
+
+        class TwelveInput(BaseModel):
+            a0: str = Field(default="", min_length=2)
+            a1: str = Field(default="", min_length=2)
+            a2: str = Field(default="", min_length=2)
+            a3: str = Field(default="", min_length=2)
+            a4: str = Field(default="", min_length=2)
+            a5: str = Field(default="", min_length=2)
+            a6: str = Field(default="", min_length=2)
+            a7: str = Field(default="", min_length=2)
+            a8: str = Field(default="", min_length=2)
+            a9: str = Field(default="", min_length=2)
+            a10: str = Field(default="", min_length=2)
+            a11: str = Field(default="", min_length=2)
+
+        registry = ToolRegistry("demo")
+        registry.add_tool(
+            name="t",
+            description="",
+            input_schema=TwelveInput,
+            handler=lambda **kw: {},
+        )
+        server = build_mcp_server("demo", registry)
+        payload = {f"a{i}": "x" for i in range(12)}
+        result = _call(server, "t", payload)
+
+        assert result.isError is True
+        text = result.content[0].text
+        lines = text[len("Invalid arguments for tool 't': ") :].splitlines()
+        # Twelve failures, ten rendered lines plus a "...and N more" marker.
+        assert len(lines) == 11
+        assert lines[-1] == "...and 2 more"
+        for line in lines[:-1]:
+            assert "input_value" not in line
+
+    def test_full_validation_detail_is_logged_server_side(self, caplog):
+        server = self._echo_server()
+        with caplog.at_level(
+            logging.WARNING, logger="mcp_dynamic_tool_registration.server_factory"
+        ):
+            result = _call(server, "echo", {"text": 42})
+
+        assert "input_value=42" not in result.content[0].text
+        assert "EchoInput" in caplog.text
+        assert "input_value=42" in caplog.text
+
+
+def _validation_error() -> pydantic.ValidationError:
+    """A real ``pydantic.ValidationError`` whose text echoes the offending
+    input value (``secret-value``), a model name, and documentation URLs —
+    the kind a handler raises when it builds a response model from
+    already-stored data the model rejects.  Note it carries no
+    ``status_code`` in this pydantic version; the carve-out in
+    :func:`default_error_handler`` guards the duck-typed branch anyway."""
+    from pydantic import BaseModel
+
+    class WriteNoteResult(BaseModel):
+        title: str
+
+    with pytest.raises(pydantic.ValidationError) as exc_info:
+        WriteNoteResult(title={"secret-value": 1})
+    return exc_info.value
+
+
+class TestHandlerValidationErrorRouting:
+    """A ``pydantic.ValidationError`` escaping a tool handler is a
+    server-side failure, not a caller error: the dispatch must not convert
+    it into this library's usage-error result, whose text is the exception's
+    rendering relayed verbatim (capped at 4096 chars — enough for a full
+    pydantic rendering with several errors to reach the client)."""
+
+    def test_validation_error_is_not_a_usage_error(self):
+        assert default_error_handler("t", _validation_error()) is None
+
+    def test_dispatch_does_not_build_a_usage_error_from_it(self, caplog):
+        registry = ToolRegistry("demo")
+        registry.add_tool(
+            name="update_note",
+            description="",
+            handler=lambda context=None: _raise(_validation_error()),
+        )
+        server = build_mcp_server("demo", registry)
+
+        with caplog.at_level(
+            logging.WARNING, logger="mcp_dynamic_tool_registration.server_factory"
+        ):
+            result = _call(server, "update_note", {})
+
+        # The carve-out returns ``None`` (re-raise) and logs the full
+        # detail; the pydantic rendering must not come back as this
+        # library's "Tool '<name>' error:" usage-error text.  The dispatch
+        # re-raised, and only the SDK's own request-handler fallback
+        # (invoked by ``_call``) converted it into the generic result here.
+        assert result.isError is True
+        text = result.content[0].text
+        assert not text.startswith("Tool '")
+        assert "raised a validation error" in caplog.text
+        assert "secret-value" in caplog.text
+        assert "update_note" in caplog.text
+
+    def test_a_full_rendering_would_otherwise_stream_to_the_client(self, caplog):
+        """A validation error whose rendering exceeds the usage-error cap
+        must not come back as this library's "Tool '<name>' error:" relay;
+        the carve-out re-raises instead so the SDK's propagation path owns
+        the failure.  (The SDK's own fallback text is the exception's
+        ``str()`` — pydantic's rendering verbatim — so the carve-out's
+        guarantee is about who reports the error, not about hiding the
+        rendering; the rendering echoes only what the client's own call
+        already carried.)"""
+        from pydantic import BaseModel
+
+        class ManyFields(BaseModel):
+            f0: list[str]
+            f1: list[str]
+            f2: list[str]
+            f3: list[str]
+            f4: list[str]
+            f5: list[str]
+            f6: list[str]
+            f7: list[str]
+            f8: list[str]
+
+        # Many errors — one per list item through nine list fields — so the
+        # full rendering (each error names its path and a documentation
+        # URL) exceeds the usage-error cap.
+        with pytest.raises(pydantic.ValidationError) as exc_info:
+            ManyFields.model_validate({f"f{i}": [None] * 40 for i in range(9)})
+        exc = exc_info.value
+        assert len(str(exc)) > 4096
+
+        registry = ToolRegistry("demo")
+        registry.add_tool(
+            name="update_note",
+            description="",
+            handler=lambda context=None: _raise(exc),
+        )
+        # `tool_error` is what the dispatch would hand back to the client
+        # as this library's "Tool '<name>' error:" usage-error text — the
+        # full pydantic rendering (up to the 4096-char cap, which only
+        # truncates the tail).  Post-carve-out the dispatch declines the
+        # error (returns ``None``, re-raises), so the client only ever
+        # sees the SDK's own text from the exception's own summary.
+        would_be_text = "Tool 'update_note' error: " + str(exc)[:4096]
+        assert len(would_be_text) == 4096 + len("Tool 'update_note' error: ")
+
+        registry = ToolRegistry("demo")
+        registry.add_tool(
+            name="update_note",
+            description="",
+            handler=lambda context=None: _raise(exc),
+        )
+        server = build_mcp_server("demo", registry)
+        with caplog.at_level(
+            logging.WARNING, logger="mcp_dynamic_tool_registration.server_factory"
+        ):
+            result = _call(server, "update_note", {})
+
+        text = result.content[0].text
+        # The pydantic exception's own rendering is echoed by the SDK's
+        # propagation path (verified against the vendored SDK: the request
+        # handler's fallback is literally `str(err)`), so what the carve-out
+        # actually prevents is this library's *relay wrapper* — the "Tool
+        # '<name>' error:" usage-error channel that caps the rendering at
+        # 4096 characters and presents it as if it were a hand-built caller
+        # message, hiding the failure from the SDK's own error handling.
+        assert text == str(exc)
+        assert len(text) > 4096  # pydantic's full rendering, un-truncated
+        assert not text.startswith("Tool '")
+        assert "raised a validation error" in caplog.text

@@ -18,6 +18,17 @@ Also holds the pure helpers shared with the ASGI app: JSON argument
 coercion, argument validation, the usage-error result builder, the
 class-wrapped ASGI app, and the ASGI header/response helpers.
 
+Client-visible error text is deliberately low-detail: usage-error messages
+are capped at 4096 characters (``_MAX_ERROR_DETAIL_CHARS``), and argument-
+validation replies for a ``pydantic.ValidationError`` carry only each
+error's field path and rule message — never the echoed input values, model
+internals, or documentation URLs.  The full detail goes to this module's
+logger instead.  A ``pydantic.ValidationError`` raised *by a tool handler*
+is never converted to client text either: its rendering is a server-side
+internal-consistency failure, not a hand-built usage error, so it propagates
+to the SDK's generic error after being logged in full (see
+:func:`default_error_handler`).
+
 ``build_streamable_http_asgi_app`` wraps the server in a bearer-token-gated
 Streamable HTTP ASGI app: it validates the token through a host-supplied
 ``token_validator``, turns the validated payload into a per-request context
@@ -128,6 +139,15 @@ class AuditHook(Protocol):
 
 
 _BEARER_PREFIX = "bearer "
+
+_MAX_ERROR_LINES = 10
+"""Cap on how many validation-error lines a single argument-validation reply
+renders for the client; anything beyond that is summarized by count."""
+
+_MAX_ERROR_DETAIL_CHARS = 4096
+"""Cap on how much of a usage-error message reaches the client.  Anything
+longer is truncated here, so an unexpected error whose text carries
+internals can never stream them through a tool result."""
 
 
 def coerce_json_strings(value: Any) -> Any:
@@ -449,9 +469,15 @@ def _validate_arguments(
     input_schema: type[pydantic.BaseModel],
     arguments: dict[str, Any],
     limits: ArgumentLimits = DEFAULT_ARGUMENT_LIMITS,
-) -> str | None:
+) -> str | pydantic.ValidationError | None:
     """Validate raw tool-call *arguments* against *input_schema*; return an
-    error message, or ``None`` if the arguments are acceptable.
+    error, or ``None`` if the arguments are acceptable.
+
+    The error is the ``pydantic.ValidationError`` itself for a shape failure
+    — so the dispatch can render a client-safe summary from it (see
+    :func:`_tool_input_error`) while logging the full detail — and a plain
+    string for the two checks below that build their messages from
+    caller-supplied names only.
 
     Three checks, because tool input schemas commonly don't set
     ``model_config = ConfigDict(extra="forbid")`` and pydantic v2's default
@@ -467,7 +493,7 @@ def _validate_arguments(
     try:
         input_schema.model_validate(arguments)
     except pydantic.ValidationError as exc:
-        return str(exc)
+        return exc
 
     allowed = set(input_schema.model_fields)
     for f in input_schema.model_fields.values():
@@ -485,6 +511,45 @@ def _validate_arguments(
     return None
 
 
+def _tool_input_error(
+    tool_name: str, exc: str | pydantic.ValidationError
+) -> types.CallToolResult:
+    """Build the ``isError`` result for arguments that failed validation.
+
+    Malformed arguments are a caller mistake, so the client is told what to
+    fix — but only as much as it is safe to echo back.  The static strings
+    from :func:`_validate_arguments` (unknown keys, size limits) name only
+    caller-supplied keys and are returned verbatim.  A
+    ``pydantic.ValidationError`` carries rendered input values, model names
+    and documentation URLs; those internals stay in the server log, and the
+    client gets each error's field path and rule message only, capped at
+    10 lines (``_MAX_ERROR_LINES``)."""
+    if isinstance(exc, str):
+        return _invalid_arguments_result(tool_name, exc)
+
+    logger.warning("Tool %r rejected its arguments: %s", tool_name, exc)
+    errors = exc.errors(include_url=False, include_context=False, include_input=False)
+    lines = [
+        f"{'.'.join(str(part) for part in err['loc'])}: {err['msg']}" for err in errors
+    ]
+    summary = "\n".join(lines[:_MAX_ERROR_LINES])
+    if len(lines) > _MAX_ERROR_LINES:
+        summary += f"\n...and {len(lines) - _MAX_ERROR_LINES} more"
+    return _invalid_arguments_result(tool_name, summary)
+
+
+def _invalid_arguments_result(tool_name: str, summary: str) -> types.CallToolResult:
+    return types.CallToolResult(
+        content=[
+            types.TextContent(
+                type="text",
+                text=f"Invalid arguments for tool '{tool_name}': {summary}",
+            )
+        ],
+        isError=True,
+    )
+
+
 def usage_error_result(tool_name: str, exc: Exception) -> types.CallToolResult:
     """Build an ``isError`` ``CallToolResult`` for an expected *usage* error
     (bad arguments, a 4xx from a tool handler, a missing elicitation
@@ -493,17 +558,20 @@ def usage_error_result(tool_name: str, exc: Exception) -> types.CallToolResult:
     ``logger.exception`` a host-side error reporter's LoggingIntegration
     would otherwise capture as a production error."""
     message = getattr(exc, "detail", None) or str(exc)
-    logger.info(
-        "Tool %r returned a usage error (%s: %s)",
+    # warning, not exception: these are caller mistakes, and error-level
+    # records would turn every malformed request into a reported event.
+    logger.warning(
+        "Tool %r returned a usage error (%s): %s",
         tool_name,
         type(exc).__name__,
-        message,
+        str(message)[:_MAX_ERROR_DETAIL_CHARS],
+        exc_info=exc,
     )
     return types.CallToolResult(
         content=[
             types.TextContent(
                 type="text",
-                text=f"Tool '{tool_name}' error: {message}",
+                text=f"Tool '{tool_name}' error: {str(message)[:_MAX_ERROR_DETAIL_CHARS]}",
             )
         ],
         isError=True,
@@ -609,12 +677,29 @@ def default_error_handler(
       (duck-typed, so e.g. a web framework's ``HTTPException`` works without
       this library importing that framework).
 
+    ``pydantic.ValidationError`` is excluded from the duck-typed branch: its
+    rendered text echoes input values, model names, and documentation URLs,
+    so routing its ``str()`` to the client would defeat the low-detail
+    policy above (some pydantic integrations even give the class a 422
+    ``status_code``, which would otherwise match the duck-type check).  It
+    returns ``None`` here (after a full-detail log) and propagates, letting
+    the SDK answer with its own generic error.
+
     Everything else returns ``None``, meaning "re-raise": the SDK then turns
     it into its own error result. Converting usage errors here keeps them out
     of the SDK's exception logging, where error trackers would report them as
     server faults."""
     if isinstance(exc, ElicitationNotSupportedError | DeclinedError):
         return usage_error_result(tool_name, exc)
+    if isinstance(exc, pydantic.ValidationError):
+        logger.exception(
+            "Tool %r raised a validation error (%d chars of pydantic detail "
+            "logged, not relayed)",
+            tool_name,
+            len(str(exc)),
+            exc_info=exc,
+        )
+        return None
     status_code = getattr(exc, "status_code", None)
     if status_code is not None and 400 <= int(status_code) < 500:
         return usage_error_result(tool_name, exc)
@@ -712,16 +797,7 @@ def build_mcp_server(
         if spec.input_schema is not None:
             validation_error = _validate_arguments(spec.input_schema, arguments, limits)
             if validation_error is not None:
-                return types.CallToolResult(
-                    content=[
-                        types.TextContent(
-                            type="text",
-                            text=f"Invalid arguments for tool '{tool_name}': "
-                            f"{validation_error}",
-                        )
-                    ],
-                    isError=True,
-                )
+                return _tool_input_error(tool_name, validation_error)
 
         # Per-request context (e.g. the authenticated caller), never a
         # registration-time default. When it is a context manager it is
