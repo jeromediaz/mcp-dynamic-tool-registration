@@ -1,0 +1,21 @@
+# Mirrors the CI "test" job so a broken release never reaches GitHub.
+# Needs the dev tools on PATH (pip install -e ".[dev]"), then once: lefthook install
+pre-commit:
+  parallel: false
+  commands:
+    ruff-check:
+      glob: "*.py"
+      run: python -m ruff check {staged_files}
+    ruff-format:
+      glob: "*.py"
+      run: python -m ruff format --check {staged_files}
+
+pre-push:
+  parallel: false
+  commands:
+    pytest:
+      run: python -m pytest -q
+    ruff:
+      run: python -m ruff check .
+    mypy:
+      run: python -m mypy src/mcp_dynamic_tool_registration
