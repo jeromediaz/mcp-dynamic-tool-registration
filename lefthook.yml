@@ -9,6 +9,10 @@ pre-commit:
     ruff-format:
       glob: "*.py"
       run: python -m ruff format --check {staged_files}
+    mypy:
+      # Whole package, not {staged_files}: a change here can break types elsewhere.
+      glob: "*.py"
+      run: python -m mypy src/mcp_dynamic_tool_registration
 
 pre-push:
   parallel: false
