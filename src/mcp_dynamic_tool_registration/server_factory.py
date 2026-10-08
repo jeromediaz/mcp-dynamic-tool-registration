@@ -749,7 +749,8 @@ def build_mcp_server(
     limits = argument_limits or DEFAULT_ARGUMENT_LIMITS
     server: Server = Server(name)
 
-    @server.list_tools()
+    # The SDK's decorators are untyped (mcp 1.28 - 1.30): not ours to fix.
+    @server.list_tools()  # type: ignore[no-untyped-call, untyped-decorator]
     async def _list_tools() -> list[types.Tool]:
         return [
             types.Tool(
@@ -777,7 +778,7 @@ def build_mcp_server(
     # validate_input=False: arguments are validated below with Pydantic, after
     # JSON-string coercion. The SDK's jsonschema validation would reject
     # double-encoded arguments before they could be coerced.
-    @server.call_tool(validate_input=False)
+    @server.call_tool(validate_input=False)  # type: ignore[untyped-decorator]
     async def _call_tool(tool_name: str, arguments: dict[str, Any]) -> Any:
         spec = tool_registry.get_tool(tool_name)
         if spec is None:

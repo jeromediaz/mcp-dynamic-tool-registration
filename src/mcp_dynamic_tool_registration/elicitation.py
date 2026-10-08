@@ -63,7 +63,7 @@ async def confirm_destructive(mcp_session: Any, message: str) -> bool:
         )
 
     try:
-        result = await asyncio.wait_for(
+        result: types.ElicitResult = await asyncio.wait_for(
             mcp_session.elicit(message=message, requestedSchema=_EMPTY_SCHEMA),
             timeout=_ELICITATION_TIMEOUT_SECONDS,
         )

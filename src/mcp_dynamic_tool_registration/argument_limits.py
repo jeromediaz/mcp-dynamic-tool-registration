@@ -78,6 +78,9 @@ class ArgumentLimits:
 DEFAULT_ARGUMENT_LIMITS = ArgumentLimits()
 """Library defaults (transport safety only) — hosts inject tighter caps."""
 
+_Frame = tuple[Any, str, Mapping[str, int] | None, int]
+"""One pending traversal step: ``(value, path, caps, cap)``."""
+
 
 @dataclass
 class _Walk:
@@ -91,7 +94,7 @@ class _Walk:
 
     def visit(
         self,
-        stack: list,
+        stack: list[_Frame],
         item: Any,
         path: str,
         caps: Mapping[str, int] | None,
@@ -120,7 +123,7 @@ class _Walk:
 
     def _visit_mapping(
         self,
-        stack: list,
+        stack: list[_Frame],
         item: Mapping[Any, Any],
         path: str,
         caps: Mapping[str, int] | None,
@@ -147,8 +150,8 @@ class _Walk:
 
     def _visit_list(
         self,
-        stack: list,
-        item: list,
+        stack: list[_Frame],
+        item: list[object],
         path: str,
         caps: Mapping[str, int] | None,
         cap: int,
@@ -211,7 +214,7 @@ def validate_argument_bounds(
     if isinstance(value, Mapping) and schema_name is not None:
         root_caps = limits.field_max_length.get(schema_name)
     walk = _Walk(limits)
-    stack: list = [(value, path, root_caps, limits.max_string_length)]
+    stack: list[_Frame] = [(value, path, root_caps, limits.max_string_length)]
     while stack:
         item, item_path, caps, cap = stack.pop()
         error = walk.visit(stack, item, item_path, caps, cap)
