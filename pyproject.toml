@@ -32,7 +32,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "ruff", "mypy"]
+dev = ["pytest", "ruff", "mypy", "httpx2"]
 
 [project.urls]
 "Homepage" = "https://github.com/jeromediaz/mcp-dynamic-tool-registration"
