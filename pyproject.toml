@@ -27,7 +27,7 @@ classifiers = [
 ]
 keywords = ["mcp", "model-context-protocol", "tools", "registry", "dynamic"]
 dependencies = [
-    "mcp>=1.28.1,<2",
+    "mcp>=1.30.0,<2",
     "pydantic>=2.11,<3",
 ]
 
