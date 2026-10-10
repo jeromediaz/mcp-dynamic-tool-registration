@@ -10,7 +10,7 @@ where = ["src"]
 
 [project]
 name = "mcp-dynamic-tool-registration"
-version = "0.2.1"
+version = "0.2.2"
 authors = [
   { name="Jérôme DIAZ", email="jerome_diaz@me.com" },
 ]
