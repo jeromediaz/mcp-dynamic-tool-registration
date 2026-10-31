@@ -7,6 +7,7 @@ import json
 import logging
 
 import pydantic
+import pytest
 from mcp import types
 from pydantic import BaseModel
 
@@ -330,6 +331,74 @@ class TestUsageErrorResult:
         assert (
             result.content[0].text == "Tool 'x' error: " + "d" * _MAX_ERROR_DETAIL_CHARS
         )
+
+    class _FakeHTTPException(Exception):
+        """Duck-typed HTTPException (detail/status_code/headers) — fastapi is
+        not a dependency of this package (same shape as
+        test_build_mcp_server's fake)."""
+
+        def __init__(self, status_code: int, detail: str, headers=None):
+            super().__init__(detail)
+            self.status_code = status_code
+            self.detail = detail
+            self.headers = headers
+
+    def test_safe_code_header_appends_suffix(self):
+        exc = self._FakeHTTPException(
+            422, "static text", {"X-Error-Code": "slug_in_use"}
+        )
+        result = usage_error_result("x", exc)
+        assert result.content == [
+            types.TextContent(
+                type="text",
+                text="Tool 'x' error: static text [code: slug_in_use]",
+            )
+        ]
+
+    def test_code_header_name_matched_case_insensitively(self):
+        exc = self._FakeHTTPException(
+            422, "static text", {"x-error-code": "slug_in_use"}
+        )
+        result = usage_error_result("x", exc)
+        text = result.content[0].text
+        assert isinstance(text, str)
+        assert text.endswith(" [code: slug_in_use]")
+
+    def test_code_suffix_survives_a_clamped_detail(self):
+        """The suffix goes AFTER the capped detail: an over-long detail can
+        never truncate the code away."""
+        exc = self._FakeHTTPException(
+            422, "d" * (_MAX_ERROR_DETAIL_CHARS + 1000), {"X-Error-Code": "slug_in_use"}
+        )
+        text = usage_error_result("x", exc).content[0].text
+        assert isinstance(text, str)
+        assert text.endswith(" [code: slug_in_use]")
+        prefix = "Tool 'x' error: "
+        detail_part = text[len(prefix) : -len(" [code: slug_in_use]")]
+        assert len(detail_part) == _MAX_ERROR_DETAIL_CHARS
+
+    @pytest.mark.parametrize(
+        "value",
+        ["Has Space", "UPPER", "a" * 65, "", "slug-in-use", 123],
+    )
+    def test_unsafe_code_header_values_are_ignored(self, value):
+        exc = self._FakeHTTPException(422, "static text", {"X-Error-Code": value})
+        result = usage_error_result("x", exc)
+        assert result.content == [
+            types.TextContent(type="text", text="Tool 'x' error: static text")
+        ]
+
+    def test_no_headers_or_none_headers_gives_unchanged_text(self):
+        exc = self._FakeHTTPException(422, "static text", None)
+        result = usage_error_result("x", exc)
+        assert result.content == [
+            types.TextContent(type="text", text="Tool 'x' error: static text")
+        ]
+        # An exception with no headers attribute at all: same text as today.
+        plain = usage_error_result("x", ValueError("plain message"))
+        assert plain.content == [
+            types.TextContent(type="text", text="Tool 'x' error: plain message")
+        ]
 
     def test_logs_full_detail_with_traceback_at_warning(self, caplog):
         """The message (full untruncated detail) and the traceback go to

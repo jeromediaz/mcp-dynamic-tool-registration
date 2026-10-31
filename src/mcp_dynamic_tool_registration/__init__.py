@@ -25,6 +25,7 @@ from .registry import (
     resolve_server_name,
 )
 from .server_factory import (
+    ERROR_CODE_HEADER,
     AsgiApp,
     AuditHook,
     ContextFactory,
@@ -50,6 +51,7 @@ __version__ = "0.2.2"
 
 __all__: list[str] = [
     "DEFAULT_ARGUMENT_LIMITS",
+    "ERROR_CODE_HEADER",
     "MAX_ARG_LIST_LENGTH",
     "MAX_ARG_STRING_LENGTH",
     "MAX_ARG_TOTAL_CHARS",

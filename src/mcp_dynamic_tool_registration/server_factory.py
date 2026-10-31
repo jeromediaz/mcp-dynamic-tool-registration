@@ -48,6 +48,7 @@ import hashlib
 import inspect
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable, Mapping
 from contextvars import ContextVar
 from typing import Any, Protocol
@@ -74,6 +75,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "DEFAULT_ARGUMENT_LIMITS",
+    "ERROR_CODE_HEADER",
     "MAX_ARG_LIST_LENGTH",
     "MAX_ARG_STRING_LENGTH",
     "MAX_ARG_TOTAL_CHARS",
@@ -148,6 +150,15 @@ _MAX_ERROR_DETAIL_CHARS = 4096
 """Cap on how much of a usage-error message reaches the client.  Anything
 longer is truncated here, so an unexpected error whose text carries
 internals can never stream them through a tool result."""
+
+ERROR_CODE_HEADER = "X-Error-Code"
+"""The header an HTTP-style exception uses to carry a stable machine-readable
+error code."""
+
+_ERROR_CODE_RE = re.compile(r"^[a-z0-9_]{1,64}$")
+"""Shape a code header value must match to be relayed to the client: a short
+lower-case token, so a caller-supplied or arbitrary value never reaches the
+tool-result text through this header."""
 
 
 def coerce_json_strings(value: Any) -> Any:
@@ -550,13 +561,37 @@ def _invalid_arguments_result(tool_name: str, summary: str) -> types.CallToolRes
     )
 
 
+def _error_code_suffix(exc: Exception) -> str:
+    """The ``" [code: <code>]"`` suffix for *exc*'s error-code header, or
+    ``""`` when it carries none.  The header name is matched
+    case-insensitively and the value is relayed only when it is a short
+    lower-case token (``_ERROR_CODE_RE``): anything else is ignored, so a
+    caller-supplied value never reaches the client text through this
+    header."""
+    headers = getattr(exc, "headers", None)
+    if not isinstance(headers, Mapping):
+        return ""
+    value = None
+    for name, candidate in headers.items():
+        if isinstance(name, str) and name.lower() == ERROR_CODE_HEADER.lower():
+            value = candidate
+            break
+    if not isinstance(value, str) or not _ERROR_CODE_RE.fullmatch(value):
+        return ""
+    return f" [code: {value}]"
+
+
 def usage_error_result(tool_name: str, exc: Exception) -> types.CallToolResult:
     """Build an ``isError`` ``CallToolResult`` for an expected *usage* error
     (bad arguments, a 4xx from a tool handler, a missing elicitation
     capability, a declined confirmation) so the client sees the message and
     the exception never reaches the SDK's request handler — whose
     ``logger.exception`` a host-side error reporter's LoggingIntegration
-    would otherwise capture as a production error."""
+    would otherwise capture as a production error.
+
+    When *exc* carries a safe ``ERROR_CODE_HEADER`` value it is appended to
+    the text AFTER the capped detail, so a long detail can never truncate
+    the code away."""
     message = getattr(exc, "detail", None) or str(exc)
     # warning, not exception: these are caller mistakes, and error-level
     # records would turn every malformed request into a reported event.
@@ -571,7 +606,11 @@ def usage_error_result(tool_name: str, exc: Exception) -> types.CallToolResult:
         content=[
             types.TextContent(
                 type="text",
-                text=f"Tool '{tool_name}' error: {str(message)[:_MAX_ERROR_DETAIL_CHARS]}",
+                text=(
+                    f"Tool '{tool_name}' error: "
+                    f"{str(message)[:_MAX_ERROR_DETAIL_CHARS]}"
+                    f"{_error_code_suffix(exc)}"
+                ),
             )
         ],
         isError=True,
